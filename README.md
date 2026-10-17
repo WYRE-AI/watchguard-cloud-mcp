@@ -13,16 +13,53 @@ Callers only ever need to supply the three long-lived values below - not the sho
 
 ## Configuration
 
+Copy [`.env.example`](.env.example) and set the variables below. Leave `CONDUIT_S2S_SECRET` empty in that file.
+
 | Env var | Description |
 |---|---|
-| `WATCHGUARDCLOUD_ACCESS_ID` | AccessID from WatchGuard Cloud API Access. |
-| `WATCHGUARDCLOUD_PASSWORD` | Password paired with the AccessID. |
-| `WATCHGUARDCLOUD_API_KEY` | WatchGuard-API-Key generated when API access is enabled. |
+| `WATCHGUARDCLOUD_ACCESS_ID` | AccessID from WatchGuard Cloud API Access. Required for stdio and `AUTH_MODE=env`. |
+| `WATCHGUARDCLOUD_PASSWORD` | Password paired with the AccessID. Required for stdio and `AUTH_MODE=env`. |
+| `WATCHGUARDCLOUD_API_KEY` | WatchGuard-API-Key generated when API access is enabled. Required for stdio and `AUTH_MODE=env`. |
 | `WATCHGUARDCLOUD_REGION` | `usa` (default), `deu` (EMEA), or `jpn` (APAC) - your account's data-storage region. |
 | `MCP_TRANSPORT` | `stdio` (default) or `http`. |
-| `AUTH_MODE` | `env` (default, reads the vars above) or `gateway` (credentials arrive per-request via `X-WatchGuardCloud-*` headers, injected by the Conduit gateway). |
-| `CONDUIT_S2S_SECRET` | When set, the HTTP transport requires a valid `X-Gateway-S2S` header (Conduit sidecar auth) on every `/mcp` request. |
+| `AUTH_MODE` | `env` (default, reads the vars above) or `gateway` (credentials arrive per-request via `X-WatchGuardCloud-*` headers, injected by the Conduit gateway). The container image and Compose set `gateway`. Gateway mode never falls back to `WATCHGUARDCLOUD_*`. |
+| `CONDUIT_S2S_SECRET` | Required to start the HTTP transport. The process logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `your-s2s-secret`, `secret`, `placeholder`, and the other example values). Compose will not start when it is unset. Never commit a real value. The value is never logged. |
+| `MCP_ALLOW_INSECURE_DEV` | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not check `X-Gateway-S2S`, and binds `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`) is ignored in that mode. A placeholder secret is still refused. |
+| `MCP_HTTP_HOST` | Bind address when a real `CONDUIT_S2S_SECRET` is set. Unset keeps the historical default of `0.0.0.0`. The container image and Compose set `0.0.0.0`. Without a real secret, the listener is `127.0.0.1` only. |
+| `MCP_HTTP_PORT` | HTTP port. Defaults to `8080`. |
 | `LOG_LEVEL` | `debug` \| `info` (default) \| `warn` \| `error`. |
+
+`/health` stays unauthenticated and does not read vendor credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
+
+### HTTP authentication
+
+With `MCP_TRANSPORT=http` and a real `CONDUIT_S2S_SECRET`, every `/mcp` request must include `X-Gateway-S2S`:
+
+```
+X-Gateway-S2S: t=<unix seconds>,v1=<hex hmac-sha256>
+```
+
+`v1` is the hex HMAC-SHA256 of the literal string `t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET`. A missing or invalid header returns 401. The timestamp must be within five minutes of the server clock.
+
+The gateway signs each `/mcp` call:
+
+```bash
+t=$(date +%s)
+sig=$(printf 't=%s' "$t" | openssl dgst -sha256 -hmac "$CONDUIT_S2S_SECRET" -hex | awk '{print $NF}')
+curl -sS -X POST http://127.0.0.1:8080/mcp \
+  -H "content-type: application/json" \
+  -H "accept: application/json, text/event-stream" \
+  -H "X-Gateway-S2S: t=${t},v1=${sig}" \
+  -H "X-WatchGuardCloud-Access-ID: $WATCHGUARDCLOUD_ACCESS_ID" \
+  -H "X-WatchGuardCloud-Password: $WATCHGUARDCLOUD_PASSWORD" \
+  -H "X-WatchGuardCloud-API-Key: $WATCHGUARDCLOUD_API_KEY" \
+  -H "X-WatchGuardCloud-Region: usa" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-WatchGuardCloud-Access-ID`, `X-WatchGuardCloud-Password`, and `X-WatchGuardCloud-API-Key` (`X-WatchGuardCloud-Region` is optional). A request missing any of those three returns 401. Those headers are the only credential source for that request.
+
+`AUTH_MODE=env` still requires a valid `X-Gateway-S2S` header, then uses `WATCHGUARDCLOUD_*` from the process environment.
 
 ## Tools
 
@@ -58,13 +95,46 @@ npm test
 npm run lint   # tsc --noEmit
 ```
 
+HTTP refuses to start until `CONDUIT_S2S_SECRET` is a real secret:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" npm run start:http
+```
+
+Local HTTP without a service-to-service secret is development-only. It binds `127.0.0.1` and logs a warning:
+
+```bash
+MCP_ALLOW_INSECURE_DEV=1 npm run start:http
+```
+
 ## Docker
+
+The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaults to `AUTH_MODE=gateway`. Publish the port on loopback and pass the S2S secret. In gateway mode, WatchGuard credentials arrive on each request as headers; they are not read from the environment.
 
 ```bash
 docker build -t watchguard-cloud-mcp .
-docker run -p 8080:8080 \
-  -e WATCHGUARDCLOUD_ACCESS_ID=... \
-  -e WATCHGUARDCLOUD_PASSWORD=... \
-  -e WATCHGUARDCLOUD_API_KEY=... \
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -p 127.0.0.1:8080:8080 \
+  watchguard-cloud-mcp
+```
+
+Compose refuses to start when `CONDUIT_S2S_SECRET` is unset, sets `AUTH_MODE=gateway`, publishes `127.0.0.1:8080:8080`, and does not inject static vendor credentials:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `WATCHGUARDCLOUD_ACCESS_ID`, `WATCHGUARDCLOUD_PASSWORD`, and `WATCHGUARDCLOUD_API_KEY`. This is separate from the gateway Compose service:
+
+```bash
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=env \
+  -e WATCHGUARDCLOUD_ACCESS_ID="$WATCHGUARDCLOUD_ACCESS_ID" \
+  -e WATCHGUARDCLOUD_PASSWORD="$WATCHGUARDCLOUD_PASSWORD" \
+  -e WATCHGUARDCLOUD_API_KEY="$WATCHGUARDCLOUD_API_KEY" \
+  -e WATCHGUARDCLOUD_REGION=usa \
+  -p 127.0.0.1:8080:8080 \
   watchguard-cloud-mcp
 ```
